@@ -23,12 +23,15 @@ pub mod crc;
 pub mod dma;
 pub mod flash;
 pub mod flexcomm;
+pub mod flexspistorage;
 pub mod gpio;
 pub mod hashcrypt;
 pub mod i2c;
 pub mod iopctl;
 pub mod pwm;
 pub mod rng;
+pub mod spinorstorage;
+pub mod storage;
 /// Time driver for the iMX RT600 series.
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
@@ -154,6 +157,7 @@ pub fn init(config: config::Config) -> Peripherals {
         dma::init();
         gpio::init();
         timer::init();
+        flexspistorage::init();
     }
 
     peripherals
