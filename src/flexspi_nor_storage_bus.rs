@@ -635,6 +635,10 @@ impl<'d, M: Mode> FlexspiNorStorageBus<'d, M> {
             .modify(|_, w| w.rxdmaen().clear_bit().clriprxf().set_bit());
 
         // TODO: Set Tx and Rx watermark
+        self.info.regs.iprxfcr().modify(|_, w| unsafe {
+            // SAFETY: Operation is safe as we are programming the watermark value to be used for the transfer
+            w.rxwmrk().bits((self.rx_watermark / 8) - 1 as u8)
+        });
 
         // Set the data length
         // Max RX FIFO size is MAX_FLEXSPI_TRANSFER_SIZE bytes
@@ -976,8 +980,9 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
 
     fn read_cmd_data(&mut self, mut size: u32, read_data: &mut [u8]) -> Result<(), NorStorageBusError> {
         let mut bytes_read = 0;
-        let mut byte_cnt = 0;
-        let num_fifo_slot;
+        let mut num_fifo_slot;
+        let num_rx_watermark_slot;
+        let slot_group;
 
         let error = self.check_transfer_status();
 
@@ -985,57 +990,61 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
             e.describe(self);
             return Err(NorStorageBusError::StorageBusIoError);
         }
-        let start = Instant::now();
-        if size < self.rx_watermark as u32 {
-            // We wont get watermark interrupt. Hence we need to check fifo fill bits
-            while (self.info.regs.iprxfsts().read().fill().bits() * 8) < size as u8 {
-                let timedout = check_timeout(start, FLEXSPI_DATA_FILL_TIMEOUT);
-                if timedout {
-                    return Err(NorStorageBusError::StorageBusIoError);
+        num_fifo_slot = size / 4;
+        num_rx_watermark_slot = self.rx_watermark / 4;
+        slot_group = num_fifo_slot / num_rx_watermark_slot as u32;
+
+        for _ in 0..slot_group {
+            // Wait for RX FIFO to be filled with water mark level data
+            while self.info.regs.intr().read().iprxwa().bit_is_clear() {}
+            for j in 0..num_rx_watermark_slot {
+                let temp = self.info.regs.rfdr(j as usize).read().bits();
+                info!("RX FIFO data: {:08X} idx = {}", temp, j);
+                for k in 0..4 {
+                    read_data[bytes_read as usize] = (temp >> (8 * k)) as u8;
+                    bytes_read += 1;
+                    size -= 1;
                 }
             }
-            num_fifo_slot = 1;
-        } else {
-            // Wait for data to reach watermark level
-            while self.info.regs.intr().read().iprxwa().bit_is_clear() {
-                let timedout = check_timeout(start, FLEXSPI_DATA_FILL_TIMEOUT);
-                if timedout {
-                    return Err(NorStorageBusError::StorageBusIoError);
+            // Pop out the water mark level data
+            self.info.regs.intr().modify(|_, w| w.iprxwa().clear_bit_by_one());
+        }
+
+        while (self.info.regs.iprxfsts().read().fill().bits() * 8) < size as u8 {}
+
+        if size > 0 {
+            // size must be between 1 and rx_watermark by now
+            let mut temp;
+            num_fifo_slot = size / 4;
+
+            for i in 0..num_fifo_slot {
+                temp = self.info.regs.rfdr(i as usize).read().bits();
+
+                for j in 0..4 {
+                    read_data[bytes_read as usize] = (temp >> (8 * j)) as u8;
+                    bytes_read += 1;
+                    size -= 1;
                 }
             }
-            num_fifo_slot = (self.rx_watermark / 4) as u32;
-        }
 
-        for i in 0..num_fifo_slot {
-            let temp = self.info.regs.rfdr(i as usize).read().bits();
-            while size > 0 && byte_cnt < 4 {
-                read_data[bytes_read as usize] = (temp >> (8 * byte_cnt)) as u8;
-                byte_cnt += 1;
-                bytes_read += 1;
-                size -= 1;
-            }
-            byte_cnt = 0;
-        }
-
-        if size < 4 && size > 0 {
-            let temp = self.info.regs.rfdr(num_fifo_slot as usize).read().bits();
-            byte_cnt = 0;
-            while size > 0 {
-                read_data[bytes_read as usize] = (temp >> (8 * byte_cnt)) as u8;
-                byte_cnt += 1;
-                bytes_read += 1;
-                size -= 1;
+            if size > 0 {
+                // size must be less than 4 bytes by now
+                temp = self.info.regs.rfdr(num_fifo_slot as usize).read().bits();
+                for j in 0..size {
+                    read_data[bytes_read as usize] = (temp >> (8 * j)) as u8;
+                    bytes_read += 1;
+                    size -= 1;
+                }
             }
         }
-
-        // Clear out the water mark level data
+        // Pop out the water mark level data
         self.info.regs.intr().modify(|_, w| w.iprxwa().clear_bit_by_one());
 
         Ok(())
     }
 
     fn write_cmd_data(&mut self, mut size: u32, write_data: &[u8]) -> Result<(), NorStorageBusError> {
-        let num_fifo_slot;
+        let mut num_fifo_slot;
         let mut byte_cnt = 0;
 
         // Check for any errors during the transfer
@@ -1044,46 +1053,59 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
             e.describe(self);
             return Err(NorStorageBusError::StorageBusIoError);
         }
-        let start = Instant::now();
-        // wait for space in TX FIFO
-        while self.info.regs.intr().read().iptxwe().bit_is_clear() {
-            let timedout = check_timeout(start, FLEXSPI_TX_FIFO_FREE_WATERMARK_TIMEOUT);
-            if timedout {
-                return Err(NorStorageBusError::StorageBusIoError);
+
+        num_fifo_slot = size / 4;
+        let num_tx_watermark_slot = self.tx_watermark / 4;
+        let slot_group = num_fifo_slot / num_tx_watermark_slot as u32;
+
+        for _ in 0..slot_group {
+            // Wait for space in TX FIFO
+            while self.info.regs.intr().read().iptxwe().bit_is_clear() {}
+
+            for j in 0..num_tx_watermark_slot {
+                let mut temp = 0;
+
+                for k in 0..4 {
+                    temp |= (write_data[byte_cnt] as u32) << (8 * k);
+                    byte_cnt += 1;
+                    size -= 1;
+                }
+                self.info.regs.tfdr(j as usize).write(|w| unsafe { w.bits(temp) });
             }
+            // Clear out the water mark level data
+            self.info.regs.intr().modify(|_, w| w.iptxwe().clear_bit_by_one());
         }
 
-        if size < self.tx_watermark as u32 {
+        if size > 0 {
+            // size must be between 1 and 7 inclusive by now
+            let mut temp = 0;
+
             num_fifo_slot = size / 4;
-        } else {
-            num_fifo_slot = (self.tx_watermark / 4) as u32;
-        }
-
-        for i in 0..num_fifo_slot {
-            let mut temp = 0;
-            for j in 0..4 {
-                temp |= (write_data[byte_cnt] as u32) << (8 * j);
-                byte_cnt += 1;
-                size -= 1;
+            for i in 0..num_fifo_slot {
+                for j in 0..4 {
+                    temp |= (write_data[byte_cnt] as u32) << (8 * j);
+                    byte_cnt += 1;
+                    size -= 1;
+                }
+                self.info.regs.tfdr(i as usize).write(|w| unsafe { w.bits(temp) });
             }
-            self.info.regs.tfdr(i as usize).write(|w| unsafe { w.bits(temp) });
-        }
-
-        if size > 0 && size < 4 {
-            let mut temp = 0;
-            byte_cnt = 0;
-            for j in 0..size {
-                temp |= (write_data[byte_cnt] as u32) << (8 * j);
-                byte_cnt += 1;
+            if size > 0 {
+                let mut temp = 0;
+                // size must be less than 4 bytes by now
+                for j in 0..size {
+                    temp |= (write_data[byte_cnt] as u32) << (8 * j);
+                    byte_cnt += 1;
+                    size -= 1;
+                }
+                self.info
+                    .regs
+                    .tfdr(num_fifo_slot as usize)
+                    .write(|w| unsafe { w.bits(temp) });
             }
-            self.info
-                .regs
-                .tfdr(num_fifo_slot as usize)
-                .write(|w| unsafe { w.bits(temp) });
-        }
 
-        // Clear out the water mark level data
-        self.info.regs.intr().modify(|_, w| w.iptxwe().clear_bit_by_one());
+            // Clear out the water mark level data
+            self.info.regs.intr().modify(|_, w| w.iptxwe().clear_bit_by_one());
+        }
 
         Ok(())
     }
