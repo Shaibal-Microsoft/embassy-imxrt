@@ -58,6 +58,77 @@ pub enum FlexSpiFlashPortDeviceInstance {
     DeviceInstance1,
 }
 
+/// FlexSPI Pin Configuration for Single Pin Mode
+pub struct SpiSinglePin<'d, T: FlexSpiPin> {
+    /// Data Pin 0
+    pub data0: Peri<'d, T>,
+}
+
+/// FlexSPI Pin Configuration for Dual Pin Mode
+pub struct SpiDualPin<'d, T: FlexSpiPin> {
+    /// Data Pin 0
+    pub data0: Peri<'d, T>,
+    /// Data Pin 1
+    pub data1: Peri<'d, T>,
+}
+
+/// FlexSPI Pin Configuration for Quad Pin Mode
+pub struct SpiQuadPin<'d, T: FlexSpiPin> {
+    /// Data Pin 0
+    pub data0: Peri<'d, T>,
+    /// Data Pin 1
+    pub data1: Peri<'d, T>,
+    /// Data Pin 2
+    pub data2: Peri<'d, T>,
+    /// Data Pin 3
+    pub data3: Peri<'d, T>,
+}
+
+/// FlexSPI Pin Configuration for Octal Pin Mode
+pub struct SpiOctalPin<'d, T: FlexSpiPin> {
+    /// Data Pin 0
+    pub data0: Peri<'d, T>,
+    /// Data Pin 1
+    pub data1: Peri<'d, T>,
+    /// Data Pin 2
+    pub data2: Peri<'d, T>,
+    /// Data Pin 3
+    pub data3: Peri<'d, T>,
+    /// Data Pin 4
+    pub data4: Peri<'d, T>,
+    /// Data Pin 5
+    pub data5: Peri<'d, T>,
+    /// Data Pin 6
+    pub data6: Peri<'d, T>,
+    /// Data Pin 7
+    pub data7: Peri<'d, T>,
+}
+
+/// FlexSPI Pin Configuration
+/// This structure is used to configure the FlexSPI pins for different modes of operation.
+pub enum FlexspiPinConfig<'d, T: FlexSpiPin> {
+    /// Single SPI Pin Configuration
+    SingleSpiPin {
+        /// Single config
+        pins: SpiSinglePin<'d, T>,
+    },
+    /// Dual SPI Pin Configuration
+    DualSpiPin {
+        /// Dual Spi config
+        pins: SpiDualPin<'d, T>,
+    },
+    /// Quad SPI Pin Configuration
+    QuadSpiPin {
+        /// Quad Spi config
+        pins: SpiQuadPin<'d, T>,
+    },
+    /// Octal SPI Pin Configuration
+    OctalSpiPin {
+        /// Octal Spi config
+        pins: SpiOctalPin<'d, T>,
+    },
+}
+
 #[derive(Clone, Copy, Debug)]
 /// FlexSPI Bus Width Enum.
 pub enum FlexSpiBusWidth {
@@ -1029,7 +1100,6 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
 
             for j in 0..num_rx_watermark_slot {
                 let temp = self.info.regs.rfdr(j as usize).read().bits();
-                info!("RX FIFO data: {:08X} idx = {}", temp, j);
                 for k in 0..4 {
                     read_data[bytes_read as usize] = (temp >> (8 * k)) as u8;
                     bytes_read += 1;
@@ -1621,49 +1691,41 @@ impl FlexSpiConfigurationPort {
 }
 
 impl<'d> FlexspiNorStorageBus<'d, Blocking> {
-    #[allow(clippy::too_many_arguments)]
     /// Create a new FlexSPI instance in blocking mode with RAM execution
-    pub fn new_blocking<T: Instance>(
+    pub fn new_blocking<T: Instance, P: FlexSpiPin>(
         _inst: Peri<'d, T>,
-        data0: Option<Peri<'d, impl FlexSpiPin>>,
-        data1: Option<Peri<'d, impl FlexSpiPin>>,
-        data2: Option<Peri<'d, impl FlexSpiPin>>,
-        data3: Option<Peri<'d, impl FlexSpiPin>>,
-        data4: Option<Peri<'d, impl FlexSpiPin>>,
-        data5: Option<Peri<'d, impl FlexSpiPin>>,
-        data6: Option<Peri<'d, impl FlexSpiPin>>,
-        data7: Option<Peri<'d, impl FlexSpiPin>>,
+        pin_config: FlexspiPinConfig<'d, P>,
         clk: Peri<'d, impl FlexSpiPin>,
         cs: Peri<'d, impl FlexSpiPin>,
         port: FlexSpiFlashPort,
         bus_width: FlexSpiBusWidth,
         dev_instance: FlexSpiFlashPortDeviceInstance,
     ) -> Self {
-        if let Some(data0) = data0 {
-            data0.config_pin();
+        match pin_config {
+            FlexspiPinConfig::SingleSpiPin { pins } => {
+                pins.data0.config_pin();
+            }
+            FlexspiPinConfig::DualSpiPin { pins } => {
+                pins.data0.config_pin();
+                pins.data1.config_pin();
+            }
+            FlexspiPinConfig::QuadSpiPin { pins } => {
+                pins.data0.config_pin();
+                pins.data1.config_pin();
+                pins.data2.config_pin();
+                pins.data3.config_pin();
+            }
+            FlexspiPinConfig::OctalSpiPin { pins } => {
+                pins.data0.config_pin();
+                pins.data1.config_pin();
+                pins.data2.config_pin();
+                pins.data3.config_pin();
+                pins.data4.config_pin();
+                pins.data5.config_pin();
+                pins.data6.config_pin();
+                pins.data7.config_pin();
+            }
         }
-        if let Some(data1) = data1 {
-            data1.config_pin();
-        }
-        if let Some(data2) = data2 {
-            data2.config_pin();
-        }
-        if let Some(data3) = data3 {
-            data3.config_pin();
-        }
-        if let Some(data4) = data4 {
-            data4.config_pin();
-        }
-        if let Some(data5) = data5 {
-            data5.config_pin();
-        }
-        if let Some(data6) = data6 {
-            data6.config_pin();
-        }
-        if let Some(data7) = data7 {
-            data7.config_pin();
-        }
-
         cs.config_pin();
         clk.config_pin();
 
