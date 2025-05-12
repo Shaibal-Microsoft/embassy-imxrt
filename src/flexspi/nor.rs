@@ -93,6 +93,7 @@ const FIFO_SLOT_SIZE: u32 = 4; // 4 bytes
 const OPERATION_SEQ_NUMBER: u8 = 0;
 const LUT_UNLOCK_CODE: u32 = 0x5AF05AF0;
 
+const MAX_PACKET_SIZE: u32 = 65535; // 65,535 bytes
 const MAX_TRANSMIT_SIZE: u32 = 1024; // 1024 bytes
 const MAX_RECEIVE_SIZE: u32 = 512; // 512 bytes
 
@@ -622,14 +623,14 @@ impl<'d> BlockingNorStorageBusDriver for FlexspiNorStorageBus<'d, Blocking> {
             match data_cmd {
                 NorStorageCmdType::Read => {
                     let buffer = read_buf.ok_or(NorStorageBusError::StorageBusInternalError)?;
-                    if cmd.data_bytes.unwrap() > MAX_RECEIVE_SIZE {
+                    if cmd.data_bytes.unwrap() > MAX_PACKET_SIZE {
                         return Err(NorStorageBusError::StorageBusInternalError);
                     }
                     self.read_data(cmd, buffer)?;
                 }
                 NorStorageCmdType::Write => {
                     let buffer = write_buf.ok_or(NorStorageBusError::StorageBusInternalError)?;
-                    if cmd.data_bytes.unwrap() > MAX_TRANSMIT_SIZE {
+                    if cmd.data_bytes.unwrap() > MAX_PACKET_SIZE {
                         return Err(NorStorageBusError::StorageBusInternalError);
                     }
                     self.write_data(cmd, buffer)?;
@@ -1014,7 +1015,9 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
             return Err(NorStorageBusError::StorageBusInternalError);
         }
 
-        self.read_cmd_data(read_buf)?;
+        for chunk in read_buf.chunks_mut(MAX_RECEIVE_SIZE as usize) {
+            self.read_cmd_data(chunk)?;
+        }
 
         Ok(())
     }
@@ -1026,8 +1029,9 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
             return Err(NorStorageBusError::StorageBusInternalError);
         }
 
-        self.write_cmd_data(write_buf)?;
-
+        for chunk in write_buf.chunks(MAX_TRANSMIT_SIZE as usize) {
+            self.write_cmd_data(chunk)?;
+        }
         Ok(())
     }
 
