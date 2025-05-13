@@ -1,16 +1,20 @@
 //! FlexSPI NOR Storage Bus Driver module for the NXP RT6xx family of microcontrollers
 //!
 use core::cmp::min;
+use core::future::poll_fn;
+use core::task::Poll;
 
+use embassy_hal_internal::interrupt::InterruptExt;
 use embassy_hal_internal::{Peri, PeripheralType};
+use embassy_sync::waitqueue::AtomicWaker;
 #[cfg(feature = "time")]
 use embassy_time::Instant;
 use mimxrt600_fcb::FlexSpiLutOpcode;
 use mimxrt600_fcb::FlexSpiLutOpcode::*;
 use paste::paste;
 use storage_bus::nor::{
-    BlockingNorStorageBusDriver, NorStorageBusError, NorStorageBusWidth, NorStorageCmd, NorStorageCmdMode,
-    NorStorageCmdType, NorStorageDummyCycles,
+    AsyncNorStorageBusDriver, BlockingNorStorageBusDriver, NorStorageBusError, NorStorageBusWidth, NorStorageCmd,
+    NorStorageCmdMode, NorStorageCmdType, NorStorageDummyCycles,
 };
 
 use crate::clocks::enable_and_reset;
@@ -109,6 +113,8 @@ const IDLE_TIMEOUT: u64 = 10; // 10 millisecond
 
 const CLOCK_100MHZ: u32 = 100_000_000;
 const DELAYCELLUNIT: u32 = 75; // 75ps
+
+static WAKER: AtomicWaker = const { AtomicWaker::new() };
 
 #[derive(Clone, Copy, Debug)]
 /// FlexSPI Port Enum.
@@ -323,11 +329,26 @@ struct Info {
 trait SealedInstance {
     fn info() -> Info;
 }
-/// Instance trait to be used for instanciating for FlexSPI HW instance
+
+trait InterruptHandler {
+    fn interrupt_enable();
+}
+/// shared functions between Controller and Target operation
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
+pub trait Instance: SealedInstance + PeripheralType + 'static + Send + InterruptHandler {
     /// Interrupt for this SPI instance.
     type Interrupt: interrupt::typelevel::Interrupt;
+}
+
+/// Interrupt handler for the CTimer modules.
+pub struct FlexspiInterruptHandler<T: Instance> {
+    _phantom: core::marker::PhantomData<T>,
+}
+
+impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for FlexspiInterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        WAKER.wake();
+    }
 }
 
 impl SealedInstance for crate::peripherals::FLEXSPI {
@@ -335,6 +356,15 @@ impl SealedInstance for crate::peripherals::FLEXSPI {
         Info {
             // SAFETY: We are just saving the reference of the FlexSPI peripheral address
             regs: unsafe { &*crate::pac::Flexspi::ptr() },
+        }
+    }
+}
+
+impl InterruptHandler for crate::peripherals::FLEXSPI {
+    fn interrupt_enable() {
+        unsafe {
+            interrupt::FLEXSPI.unpend();
+            interrupt::FLEXSPI.enable();
         }
     }
 }
@@ -356,13 +386,14 @@ impl Mode for Async {}
 
 #[allow(private_interfaces)]
 /// FlexSPI Configuration Manager Port
-pub struct FlexSpiConfigurationPort {
+pub struct FlexSpiConfigurationPort<M: Mode> {
     /// Flash Port
     flash_port: FlexSpiFlashPort,
     /// Device Instance
     device_instance: FlexSpiFlashPortDeviceInstance,
     /// FlexSPI HW Info Object
     info: Info,
+    _phantom: core::marker::PhantomData<M>,
 }
 
 /// FlexSPI instance
@@ -373,10 +404,9 @@ pub struct FlexspiNorStorageBus<'d, M: Mode> {
     rx_watermark: u8,
     /// TX FIFO Watermark Level
     tx_watermark: u8,
-    /// Mode Phantom object
-    _mode: core::marker::PhantomData<M>,
     /// FlexSPI Configuration Port
-    pub configport: FlexSpiConfigurationPort,
+    pub configport: FlexSpiConfigurationPort<M>,
+    /// Phantom data to keep the lifetime of the FlexSPI instance
     phantom: core::marker::PhantomData<&'d ()>,
 }
 
@@ -583,6 +613,52 @@ impl FlexSpiError {
             }
             FlexSpiError::DataLearningFailed => info!("Data learning failed"),
         }
+    }
+}
+
+impl<'d> AsyncNorStorageBusDriver for FlexspiNorStorageBus<'d, Async> {
+    async fn send_command(
+        &mut self,
+        cmd: NorStorageCmd,
+        read_buf: Option<&mut [u8]>,
+        write_buf: Option<&[u8]>,
+    ) -> Result<(), NorStorageBusError> {
+        // Setup the transfer to be sent of the FlexSPI IP Port
+        self.setup_ip_transfer(OPERATION_SEQ_NUMBER, cmd.addr, cmd.data_bytes);
+
+        // Program the LUT instructions for the command
+        self.program_lut(&cmd, OPERATION_SEQ_NUMBER as u8);
+
+        // Start the transfer
+        self.execute_ip_cmd();
+
+        // Wait for command to complete
+        // This wait is for FlexSPI to send the command to the Flash device
+        // But the command completion in the flash needs to be checked separately
+        // by reading the status register of the flash device
+
+        self.wait_for_cmd_completion().await;
+
+        // Check for any errors during the transfer
+        self.check_transfer_status().map_err(|e| {
+            e.describe(self);
+            <FlexSpiError as Into<FlexSpiError>>::into(e)
+        })?;
+
+        // For data transfer commands, read/write the data
+        if let Some(data_cmd) = cmd.cmdtype {
+            match data_cmd {
+                NorStorageCmdType::Read => {
+                    let buffer = read_buf.ok_or(NorStorageBusError::StorageBusInternalError)?;
+                    self.read_data(cmd, buffer).await?;
+                }
+                NorStorageCmdType::Write => {
+                    let buffer = write_buf.ok_or(NorStorageBusError::StorageBusInternalError)?;
+                    self.write_data(cmd, buffer).await?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -979,6 +1055,168 @@ impl<'d, M: Mode> FlexspiNorStorageBus<'d, M> {
     }
 }
 
+impl<'d> FlexspiNorStorageBus<'d, Async> {
+    async fn read_data(&mut self, cmd: NorStorageCmd, read_buf: &mut [u8]) -> Result<(), NorStorageBusError> {
+        let size = cmd.data_bytes.ok_or(NorStorageBusError::StorageBusInternalError)?;
+
+        if read_buf.len() != size as usize {
+            return Err(NorStorageBusError::StorageBusInternalError);
+        }
+
+        for chunk in read_buf.chunks_mut(MAX_TRANSFER_SIZE as usize) {
+            self.read_cmd_data(chunk).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_data(&mut self, cmd: NorStorageCmd, write_buf: &[u8]) -> Result<(), NorStorageBusError> {
+        let size = cmd.data_bytes.ok_or(NorStorageBusError::StorageBusInternalError)?;
+        if write_buf.len() != size as usize {
+            return Err(NorStorageBusError::StorageBusInternalError);
+        }
+
+        for chunk in write_buf.chunks(MAX_TRANSFER_SIZE as usize) {
+            self.write_cmd_data(chunk).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn wait_for_cmd_completion(&mut self) {
+        poll_fn(|cx| {
+            WAKER.register(cx.waker());
+
+            self.info.regs.inten().modify(|_, w| w.ipcmddoneen().set_bit());
+
+            if self.info.regs.intr().read().ipcmddone().bit_is_clear() {
+                return Poll::Pending;
+            }
+
+            self.info.regs.intr().modify(|_, w| w.ipcmddone().clear_bit_by_one());
+
+            Poll::Ready(())
+        })
+        .await
+    }
+
+    async fn read_cmd_data(&mut self, read_data: &mut [u8]) -> Result<(), NorStorageBusError> {
+        let num_rx_watermark_slot;
+        let mut size = read_data.len() as u32;
+
+        let error = self.check_transfer_status();
+
+        if let Err(e) = error {
+            e.describe(self);
+            return Err(NorStorageBusError::StorageBusIoError);
+        }
+
+        num_rx_watermark_slot = self.rx_watermark / FIFO_SLOT_SIZE as u8;
+
+        poll_fn(|cx| {
+            WAKER.register(cx.waker());
+
+            // Enable the RX watermark interrupt
+            self.info.regs.inten().modify(|_, w| w.iprxwaen().set_bit());
+
+            for watermark_sized_chunk in read_data.chunks_mut(self.rx_watermark as usize) {
+                if watermark_sized_chunk.len() < self.rx_watermark as usize {
+                    // There is no interrupt for data size < watermark size
+                    #[cfg(feature = "time")]
+                    {
+                        let start = Instant::now();
+                        while ((self.info.regs.iprxfsts().read().fill().bits() * 8) as u32) < size {
+                            let timedout = is_expired(start, DATA_FILL_TIMEOUT);
+                            if timedout {
+                                return Poll::Ready(Err(NorStorageBusError::StorageBusInternalError));
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "time"))]
+                    {
+                        while ((self.info.regs.iprxfsts().read().fill().bits() * 8) as u32) < size {}
+                    }
+                } else {
+                    if self.info.regs.intr().read().iprxwa().bit_is_clear() {
+                        return Poll::Pending;
+                    }
+                }
+                for (chunk, slot) in watermark_sized_chunk
+                    .chunks_mut(FIFO_SLOT_SIZE as usize)
+                    .zip(0..num_rx_watermark_slot)
+                {
+                    let data = self.info.regs.rfdr(slot as usize).read().bits();
+                    if chunk.len() < FIFO_SLOT_SIZE as usize {
+                        // We cannot do copy from slice as it will cause a panic
+                        for i in 0..chunk.len() {
+                            chunk[i] = (data >> (i * 8)) as u8;
+                        }
+                    } else {
+                        chunk.copy_from_slice(&data.to_le_bytes());
+                    }
+                    size -= chunk.len() as u32;
+                }
+                self.info.regs.intr().modify(|_, w| w.iprxwa().clear_bit_by_one());
+            }
+
+            Poll::Ready(Ok(()))
+        })
+        .await
+    }
+
+    async fn write_cmd_data(&mut self, write_data: &[u8]) -> Result<(), NorStorageBusError> {
+        // Check for any errors during the transfer
+        let error = self.check_transfer_status();
+        if let Err(e) = error {
+            e.describe(self);
+            return Err(NorStorageBusError::StorageBusIoError);
+        }
+
+        let num_tx_watermark_slot = self.tx_watermark / FIFO_SLOT_SIZE as u8;
+
+        poll_fn(|cx| {
+            WAKER.register(cx.waker());
+
+            // Enable the TX watermark interrupt
+            self.info.regs.inten().modify(|_, w| w.iptxween().set_bit());
+
+            for watermark_sized_chunk in write_data.chunks(self.tx_watermark as usize) {
+                // Wait for space in TX FIFO
+                if self.info.regs.intr().read().iptxwe().bit_is_clear() {
+                    return Poll::Pending;
+                }
+
+                for (chunk, slot) in watermark_sized_chunk
+                    .chunks(FIFO_SLOT_SIZE as usize)
+                    .zip(0..num_tx_watermark_slot)
+                {
+                    let mut temp = 0_u32;
+                    if chunk.len() < FIFO_SLOT_SIZE as usize {
+                        // We cannot do copy from slice as it will cause a panic
+                        for i in 0..chunk.len() as u32 {
+                            temp |= (chunk[i as usize] as u32) << (i * 8);
+                        }
+                    } else {
+                        temp = u32::from_ne_bytes(
+                            chunk
+                                .try_into()
+                                .map_err(|_| NorStorageBusError::StorageBusInternalError)?,
+                        );
+                    }
+                    self.info.regs.tfdr(slot as usize).write(|w| unsafe {
+                        //SAFETY: Operation is safe as we are programming the data to be sent to the flash
+                        w.bits(temp)
+                    });
+                }
+                // Clear out the water mark level data
+                self.info.regs.intr().modify(|_, w| w.iptxwe().clear_bit_by_one());
+            }
+
+            Poll::Ready(Ok(()))
+        })
+        .await
+    }
+}
+
 impl<'d> FlexspiNorStorageBus<'d, Blocking> {
     fn read_data(&mut self, cmd: NorStorageCmd, read_buf: &mut [u8]) -> Result<(), NorStorageBusError> {
         let size = cmd.data_bytes.ok_or(NorStorageBusError::StorageBusInternalError)?;
@@ -1150,7 +1388,313 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
     }
 }
 
-impl FlexSpiConfigurationPort {
+impl FlexSpiConfigurationPort<Async> {
+    /// Initialize FlexSPI
+    pub async fn configure_flexspi(&mut self, config: &FlexspiConfig) -> Result<(), ()> {
+        let regs = self.info.regs;
+
+        // Enable Clock and deassert Reset
+        enable_and_reset::<peripherals::FLEXSPI>();
+
+        let sysctl_reg = unsafe { &*crate::pac::Sysctl0::ptr() };
+        sysctl_reg
+            .pdruncfg1_clr()
+            .write(|w| w.flexspi_sram_apd().clr_pdruncfg1().flexspi_sram_ppd().clr_pdruncfg1());
+
+        poll_fn(|cx| {
+            WAKER.register(cx.waker());
+            // These register sequence needs to be updated sequentially. Hence we dont merge the calls
+            regs.mcr0().modify(|_, w| w.swreset().set_bit());
+
+            if regs.mcr0().read().swreset().bit_is_set() {
+                return Poll::Pending;
+            }
+
+            //• Set MCR0[MDIS] to 0x1 (Make sure self.flexspi_ref is configured in module stop mode)
+            regs.mcr0().modify(|_, w| w.mdis().set_bit());
+
+            //• Configure module control registers: MCR0, MCR1, MCR2. (Don't change MCR0[MDIS])
+            regs.mcr0().modify(|_, w| {
+                w.rxclksrc()
+                    .variant(config.rx_sample_clock)
+                    .dozeen()
+                    .variant(config.enable_doze)
+                    .sckfreerunen()
+                    .variant(config.enable_sck_free_running)
+                    .hsen()
+                    .variant(config.enable_half_speed_access)
+            });
+
+            regs.mcr1().modify(|_, w| unsafe {
+                w.ahbbuswait()
+                    .bits(config.ahb_config.ahb_bus_timeout_cycle)
+                    .seqwait()
+                    .bits(config.seq_timeout_cycle)
+            });
+
+            regs.mcr2().modify(|_, w| unsafe {
+                w.samedeviceen()
+                    .variant(config.enable_same_config_for_all)
+                    .resumewait()
+                    .bits(config.ahb_config.resume_wait_cycle)
+                    .sckbdiffopt()
+                    .variant(config.enable_sck_b_diff_opt)
+                    .clrahbbufopt()
+                    .variant(config.ahb_config.enable_clear_ahb_buffer_opt)
+            });
+
+            regs.ahbcr().modify(|_, w| {
+                w.readaddropt()
+                    .variant(config.ahb_config.enable_read_address_opt)
+                    .bufferableen()
+                    .variant(config.ahb_config.enable_ahb_bufferable)
+                    .cachableen()
+                    .variant(config.ahb_config.enable_ahb_cachable)
+            });
+
+            regs.ahbcr()
+                .modify(|_, w| w.prefetchen().variant(config.ahb_config.enable_ahb_prefetch));
+
+            regs.ahbrxbuf0cr0().modify(|_, w| unsafe {
+                w.mstrid()
+                    .bits(0)
+                    .prefetchen()
+                    .set_bit()
+                    .bufsz()
+                    .bits(256)
+                    .priority()
+                    .bits(0)
+            });
+
+            regs.ahbrxbuf1cr0().modify(|_, w| unsafe {
+                w.mstrid()
+                    .bits(0)
+                    .prefetchen()
+                    .set_bit()
+                    .bufsz()
+                    .bits(256)
+                    .priority()
+                    .bits(0)
+            });
+
+            regs.ahbrxbuf2cr0().modify(|_, w| unsafe {
+                w.mstrid()
+                    .bits(0)
+                    .prefetchen()
+                    .set_bit()
+                    .bufsz()
+                    .bits(256)
+                    .priority()
+                    .bits(0)
+            });
+
+            regs.ahbrxbuf3cr0().modify(|_, w| unsafe {
+                w.mstrid()
+                    .bits(0)
+                    .prefetchen()
+                    .set_bit()
+                    .bufsz()
+                    .bits(256)
+                    .priority()
+                    .bits(0)
+            });
+
+            regs.ahbrxbuf4cr0().modify(|_, w| unsafe {
+                w.mstrid()
+                    .bits(0)
+                    .prefetchen()
+                    .set_bit()
+                    .bufsz()
+                    .bits(256)
+                    .priority()
+                    .bits(0)
+            });
+
+            regs.ahbrxbuf5cr0().modify(|_, w| unsafe {
+                w.mstrid()
+                    .bits(0)
+                    .prefetchen()
+                    .set_bit()
+                    .bufsz()
+                    .bits(256)
+                    .priority()
+                    .bits(0)
+            });
+
+            regs.ahbrxbuf6cr0().modify(|_, w| unsafe {
+                w.mstrid()
+                    .bits(0)
+                    .prefetchen()
+                    .set_bit()
+                    .bufsz()
+                    .bits(256)
+                    .priority()
+                    .bits(0)
+            });
+
+            regs.ahbrxbuf7cr0().modify(|_, w| unsafe {
+                w.mstrid()
+                    .bits(0)
+                    .prefetchen()
+                    .set_bit()
+                    .bufsz()
+                    .bits(256)
+                    .priority()
+                    .bits(0)
+            });
+
+            // • Initialize Flash control registers (FLSHxCR0,FLSHxCR1,FLSHxCR2)
+            match (self.flash_port, self.device_instance) {
+                (FlexSpiFlashPort::PortA, FlexSpiFlashPortDeviceInstance::DeviceInstance0) => {
+                    regs.flsha1cr0().modify(|_, w| unsafe { w.flshsz().bits(0) });
+                }
+                (FlexSpiFlashPort::PortA, FlexSpiFlashPortDeviceInstance::DeviceInstance1) => {
+                    regs.flsha2cr0().modify(|_, w| unsafe { w.flshsz().bits(0) });
+                }
+                (FlexSpiFlashPort::PortB, FlexSpiFlashPortDeviceInstance::DeviceInstance0) => {
+                    regs.flshb1cr0().modify(|_, w| unsafe { w.flshsz().bits(0) });
+                }
+                (FlexSpiFlashPort::PortB, FlexSpiFlashPortDeviceInstance::DeviceInstance1) => {
+                    regs.flshb2cr0().modify(|_, w| unsafe { w.flshsz().bits(0) });
+                }
+            }
+
+            regs.iprxfcr().modify(|_, w| unsafe { w.rxwmrk().bits(0) });
+            regs.iptxfcr().modify(|_, w| unsafe { w.txwmrk().bits(0) });
+
+            // Enabled interrupts
+            regs.inten().modify(|_, w| {
+                w.ipcmdgeen()
+                    .set_bit()
+                    .ahbcmdgeen()
+                    .set_bit()
+                    .ipcmderren()
+                    .set_bit()
+                    .ahbcmderren()
+                    .set_bit()
+                    .datalearnfailen()
+                    .set_bit()
+                    .sckstopbyrden()
+                    .set_bit()
+                    .sckstopbywren()
+                    .set_bit()
+                    .ahbbustimeouten()
+                    .set_bit()
+                    .seqtimeouten()
+                    .set_bit()
+            });
+
+            Poll::Ready(Ok(()))
+        })
+        .await
+    }
+
+    /// Configure the flash self.flexspi_ref based on the external flash device
+    pub async fn configure_device_port(
+        &self,
+        device_config: &FlexspiDeviceConfig,
+        flexspi_config: &FlexspiConfig,
+    ) -> Result<(), ()> {
+        let regs = self.info.regs;
+        let inst = match self.device_instance {
+            FlexSpiFlashPortDeviceInstance::DeviceInstance0 => 0,
+            FlexSpiFlashPortDeviceInstance::DeviceInstance1 => 1,
+        };
+
+        poll_fn(|cx| {
+            WAKER.register(cx.waker());
+
+            if !(regs.sts0().read().arbidle().bit_is_set() && regs.sts0().read().seqidle().bit_is_set()) {
+                return Poll::Pending;
+            }
+
+            regs.dllcr(inst).modify(|_, w| {
+                let is_unified_config;
+                let mut dll_value;
+                let temp;
+
+                let rx_sample_clock = flexspi_config.rx_sample_clock;
+                match rx_sample_clock {
+                    Rxclksrc::Rxclksrc0 => {
+                        is_unified_config = true;
+                    }
+                    Rxclksrc::Rxclksrc1 => {
+                        is_unified_config = true;
+                    }
+                    Rxclksrc::Rxclksrc3 => {
+                        is_unified_config = device_config.is_sck2_enabled;
+                    }
+                }
+                w.ovrden().variant(is_unified_config);
+                if device_config.flexspi_root_clk >= CLOCK_100MHZ {
+                    /* DLLEN = 1, SLVDLYTARGET = 0xF, */
+                    unsafe {
+                        w.slvdlytarget().bits(0xF).dllen().set_bit();
+                    }
+                } else {
+                    temp = (device_config.data_valid_time) as u32 * 1000; /* Convert data valid time in ns to ps. */
+                    dll_value = temp / DELAYCELLUNIT as u32;
+                    if dll_value * (DELAYCELLUNIT as u32) < temp {
+                        dll_value += 1;
+                    }
+                    unsafe {
+                        w.ovrdval().bits((dll_value) as u8);
+                    }
+                }
+                w
+            });
+
+            regs.flshcr4().modify(|_, w| match self.flash_port {
+                FlexSpiFlashPort::PortA => w.wmena().variant(device_config.enable_write_mask_port_a),
+                FlexSpiFlashPort::PortB => w.wmenb().variant(device_config.enable_write_mask_port_b),
+            });
+
+            match self.flash_port {
+                FlexSpiFlashPort::PortA => self.configure_flexspi_device_port_a(device_config)?,
+                FlexSpiFlashPort::PortB => self.configure_flexspi_device_port_b(device_config)?,
+            }
+
+            // Enable the module
+            regs.mcr0().modify(|_, w| w.mdis().clear_bit());
+
+            Poll::Ready(Ok(()))
+        })
+        .await
+    }
+
+    fn configure_flexspi_device_port_a(&self, device_config: &FlexspiDeviceConfig) -> Result<(), ()> {
+        let regs = self.info.regs;
+        let flash_size = device_config.flash_size_kb;
+
+        match self.device_instance {
+            FlexSpiFlashPortDeviceInstance::DeviceInstance0 => {
+                configure_ports_a!(1, regs, device_config, flash_size);
+            }
+
+            FlexSpiFlashPortDeviceInstance::DeviceInstance1 => {
+                configure_ports_a!(2, regs, device_config, flash_size);
+            }
+        }
+        Ok(())
+    }
+
+    fn configure_flexspi_device_port_b(&self, device_config: &FlexspiDeviceConfig) -> Result<(), ()> {
+        let regs = self.info.regs;
+        let flash_size = device_config.flash_size_kb;
+
+        match self.device_instance {
+            FlexSpiFlashPortDeviceInstance::DeviceInstance0 => {
+                configure_ports_b!(1, regs, device_config, flash_size);
+            }
+            FlexSpiFlashPortDeviceInstance::DeviceInstance1 => {
+                configure_ports_b!(2, regs, device_config, flash_size);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FlexSpiConfigurationPort<Blocking> {
     /// Initialize FlexSPI
     pub fn configure_flexspi(&mut self, config: &FlexspiConfig) -> Result<(), ()> {
         let regs = self.info.regs;
@@ -1465,11 +2009,11 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
 
         Self {
             info: T::info(),
-            _mode: core::marker::PhantomData,
             configport: FlexSpiConfigurationPort {
                 info: T::info(),
                 device_instance: config.dev_instance,
                 flash_port: config.port,
+                _phantom: core::marker::PhantomData,
             },
             rx_watermark: config.rx_watermark,
             tx_watermark: config.tx_watermark,
@@ -1493,11 +2037,11 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
         cs.config_pin();
         Self {
             info: T::info(),
-            _mode: core::marker::PhantomData,
             configport: FlexSpiConfigurationPort {
                 info: T::info(),
                 device_instance: config.dev_instance,
                 flash_port: config.port,
+                _phantom: core::marker::PhantomData,
             },
             rx_watermark: config.rx_watermark,
             tx_watermark: config.tx_watermark,
@@ -1525,11 +2069,11 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
         cs.config_pin();
         Self {
             info: T::info(),
-            _mode: core::marker::PhantomData,
             configport: FlexSpiConfigurationPort {
                 info: T::info(),
                 device_instance: config.dev_instance,
                 flash_port: config.port,
+                _phantom: core::marker::PhantomData,
             },
             rx_watermark: config.rx_watermark,
             tx_watermark: config.tx_watermark,
@@ -1565,11 +2109,11 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
         cs.config_pin();
         Self {
             info: T::info(),
-            _mode: core::marker::PhantomData,
             configport: FlexSpiConfigurationPort {
                 info: T::info(),
                 device_instance: config.dev_instance,
                 flash_port: config.port,
+                _phantom: core::marker::PhantomData,
             },
             rx_watermark: config.rx_watermark,
             tx_watermark: config.tx_watermark,
@@ -1581,11 +2125,11 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
     pub fn new_blocking_no_pin_config<T: Instance>(_inst: Peri<'d, T>, config: FlexspiConfigPortData) -> Self {
         Self {
             info: T::info(),
-            _mode: core::marker::PhantomData,
             configport: FlexSpiConfigurationPort {
                 info: T::info(),
                 device_instance: config.dev_instance,
                 flash_port: config.port,
+                _phantom: core::marker::PhantomData,
             },
             rx_watermark: config.rx_watermark,
             tx_watermark: config.tx_watermark,
@@ -1594,6 +2138,166 @@ impl<'d> FlexspiNorStorageBus<'d, Blocking> {
     }
 }
 
+impl<'d> FlexspiNorStorageBus<'d, Async> {
+    /// Create a new FlexSPI instance in async mode with single configuration
+    pub fn new_async_single_config<T: Instance>(
+        _inst: Peri<'d, T>,
+        data0: Peri<'d, impl FlexSpiPin>,
+        data1: Peri<'d, impl FlexSpiPin>,
+        clk: Peri<'d, impl FlexSpiPin>,
+        cs: Peri<'d, impl FlexSpiPin>,
+        config: FlexspiConfigPortData,
+    ) -> Self {
+        // Configure the pins
+        data0.config_pin();
+        data1.config_pin();
+        clk.config_pin();
+        cs.config_pin();
+
+        T::interrupt_enable();
+
+        Self {
+            info: T::info(),
+            configport: FlexSpiConfigurationPort {
+                info: T::info(),
+                device_instance: config.dev_instance,
+                flash_port: config.port,
+                _phantom: core::marker::PhantomData,
+            },
+            rx_watermark: config.rx_watermark,
+            tx_watermark: config.tx_watermark,
+            phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// Create a new FlexSPI instance in blocking mode with Dual configuration
+    pub fn new_async_dual_config<T: Instance>(
+        _inst: Peri<'d, T>,
+        data0: Peri<'d, impl FlexSpiPin>,
+        data1: Peri<'d, impl FlexSpiPin>,
+        clk: Peri<'d, impl FlexSpiPin>,
+        cs: Peri<'d, impl FlexSpiPin>,
+        config: FlexspiConfigPortData,
+    ) -> Self {
+        // Configure the pins
+        data0.config_pin();
+        data1.config_pin();
+        clk.config_pin();
+        cs.config_pin();
+
+        // T::interrupt_enable();
+
+        Self {
+            info: T::info(),
+            configport: FlexSpiConfigurationPort {
+                info: T::info(),
+                device_instance: config.dev_instance,
+                flash_port: config.port,
+                _phantom: core::marker::PhantomData,
+            },
+            rx_watermark: config.rx_watermark,
+            tx_watermark: config.tx_watermark,
+            phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// Create a new FlexSPI instance in blocking mode with Quad configuration
+    pub fn new_async_quad_config<T: Instance>(
+        _inst: Peri<'d, T>,
+        data0: Peri<'d, impl FlexSpiPin>,
+        data1: Peri<'d, impl FlexSpiPin>,
+        data2: Peri<'d, impl FlexSpiPin>,
+        data3: Peri<'d, impl FlexSpiPin>,
+        clk: Peri<'d, impl FlexSpiPin>,
+        cs: Peri<'d, impl FlexSpiPin>,
+        config: FlexspiConfigPortData,
+    ) -> Self {
+        // Configure the pins
+        data0.config_pin();
+        data1.config_pin();
+        data2.config_pin();
+        data3.config_pin();
+        clk.config_pin();
+        cs.config_pin();
+
+        T::interrupt_enable();
+
+        Self {
+            info: T::info(),
+            configport: FlexSpiConfigurationPort {
+                info: T::info(),
+                device_instance: config.dev_instance,
+                flash_port: config.port,
+                _phantom: core::marker::PhantomData,
+            },
+            rx_watermark: config.rx_watermark,
+            tx_watermark: config.tx_watermark,
+            phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// Create a new FlexSPI instance in blocking mode with octal configuration
+    pub fn new_async_octal_config<T: Instance>(
+        _inst: Peri<'d, T>,
+        data0: Peri<'d, impl FlexSpiPin>,
+        data1: Peri<'d, impl FlexSpiPin>,
+        data2: Peri<'d, impl FlexSpiPin>,
+        data3: Peri<'d, impl FlexSpiPin>,
+        data4: Peri<'d, impl FlexSpiPin>,
+        data5: Peri<'d, impl FlexSpiPin>,
+        data6: Peri<'d, impl FlexSpiPin>,
+        data7: Peri<'d, impl FlexSpiPin>,
+        clk: Peri<'d, impl FlexSpiPin>,
+        cs: Peri<'d, impl FlexSpiPin>,
+        config: FlexspiConfigPortData,
+    ) -> Self {
+        // Configure the pins
+        data0.config_pin();
+        data1.config_pin();
+        data2.config_pin();
+        data3.config_pin();
+        data4.config_pin();
+        data5.config_pin();
+        data6.config_pin();
+        data7.config_pin();
+        clk.config_pin();
+        cs.config_pin();
+
+        T::interrupt_enable();
+
+        Self {
+            info: T::info(),
+            configport: FlexSpiConfigurationPort {
+                info: T::info(),
+                device_instance: config.dev_instance,
+                flash_port: config.port,
+                _phantom: core::marker::PhantomData,
+            },
+            rx_watermark: config.rx_watermark,
+            tx_watermark: config.tx_watermark,
+            phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// Create a new FlexSPI instance in blocking mode without pin configuration
+    pub fn new_async_no_pin_config<T: Instance>(_inst: Peri<'d, T>, config: FlexspiConfigPortData) -> Self {
+        T::interrupt_enable();
+        Self {
+            info: T::info(),
+            configport: FlexSpiConfigurationPort {
+                info: T::info(),
+                device_instance: config.dev_instance,
+                flash_port: config.port,
+                _phantom: core::marker::PhantomData,
+            },
+            rx_watermark: config.rx_watermark,
+            tx_watermark: config.tx_watermark,
+            phantom: core::marker::PhantomData,
+        }
+    }
+}
+
+// Macro to implement the FlexSpiPin trait for each pin
 macro_rules! impl_pin {
     ($peri:ident, $fn: ident) => {
         impl FlexSpiPin for crate::peripherals::$peri {

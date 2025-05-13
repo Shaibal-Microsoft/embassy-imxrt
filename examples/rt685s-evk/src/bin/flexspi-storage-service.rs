@@ -400,7 +400,27 @@ async fn main(_spawner: Spawner) {
         ahb_config,
     };
 
-    let mut flexspi_storage = FlexspiNorStorageBus::new_blocking_octal_config(
+    // let mut flexspi_storage = FlexspiNorStorageBus::new_blocking_octal_config(
+    //     p.FLEXSPI, // FlexSPI peripheral
+    //     p.PIO1_11,
+    //     p.PIO1_12,
+    //     p.PIO1_13,
+    //     p.PIO1_14,
+    //     p.PIO2_17,
+    //     p.PIO2_18,
+    //     p.PIO2_22,
+    //     p.PIO2_23,
+    //     p.PIO1_29,
+    //     p.PIO2_19,
+    //     FlexspiConfigPortData {
+    //         port: FlexSpiFlashPort::PortB,                                 // FlexSPI port
+    //         dev_instance: FlexSpiFlashPortDeviceInstance::DeviceInstance0, // FlexSPI device instance
+    //         rx_watermark: 0x8,
+    //         tx_watermark: 0x8,
+    //     },
+    // );
+
+    let mut flexspi_storage_async = FlexspiNorStorageBus::new_async_octal_config(
         p.FLEXSPI, // FlexSPI peripheral
         p.PIO1_11,
         p.PIO1_12,
@@ -421,14 +441,18 @@ async fn main(_spawner: Spawner) {
     );
 
     // Configure the Flexspi controller
-    let _ = flexspi_storage.configport.configure_flexspi(&flexspi_config); // Configure the Flexspi controller
-
-    let _ = flexspi_storage
+    let _ = flexspi_storage_async
         .configport
-        .configure_device_port(&flash_config, &flexspi_config); // Configure the Flash device specific parameters like CS time, etc
+        .configure_flexspi(&flexspi_config)
+        .await; // Configure the Flexspi controller
+
+    let _ = flexspi_storage_async
+        .configport
+        .configure_device_port(&flash_config, &flexspi_config)
+        .await; // Configure the Flash device specific parameters like CS time, etc
 
     // Instantiate the storage device driver and inject the bus driver dependency
-    let mut device_driver = MacronixDeviceDriver::new_blocking(flexspi_storage, 0x4000000).unwrap();
+    let mut device_driver = MacronixDeviceDriver::new_blocking(flexspi_storage_async, 0x4000000).unwrap();
 
     // Read JEDEC ID
     let mut jedec_id = [0_u8; 4];
